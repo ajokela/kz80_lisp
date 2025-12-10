@@ -1,0 +1,11 @@
+[package]
+name = "kz80_lisp"
+version = "0.1.0"
+edition = "2021"
+description = "A minimal LISP interpreter for RetroShield Z80"
+
+[dependencies]
+
+[[bin]]
+name = "kz80_lisp"
+path = "src/main.rs"
