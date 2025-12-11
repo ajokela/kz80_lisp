@@ -369,6 +369,9 @@ impl CodeGen {
     /// EX DE,HL
     fn ex_de_hl(&mut self) { self.emit(0xEB); }
 
+    /// EX (SP),HL - exchange HL with top of stack
+    fn ex_sp_hl(&mut self) { self.emit(0xE3); }
+
     /// LD (nn), HL
     fn ld_mem_hl(&mut self, addr: u16) { self.emit(0x22); self.emit16(addr); }
 
@@ -503,9 +506,13 @@ impl CodeGen {
     const SYM_FDIV: u16 = 0x2003;     // 'FDIV' - float divide
     const SYM_FTOI: u16 = 0x2103;     // 'FTOI' - float to integer
     const SYM_ITOF: u16 = 0x2203;     // 'ITOF' - integer to float
+    const SYM_RTADDR: u16 = 0x2303;   // 'RTADDR' - get runtime address of a builtin
 
-    // Float tag (uses low 2 bits like other types)
-    const TAG_FLOAT: u8 = 0x04;       // Boxed BCD float
+    // Float tag: use 0x05 (bits 0 and 2 set)
+    // This makes floats look like fixnums (L & 0x03 = 0x01) but with bit 2 set
+    // We distinguish by high byte: floats are in heap (H >= 0x50), fixnums are not
+    // Float pointers: 8-byte aligned heap address | 0x05 -> L & 0x07 = 0x05, H >= 0x50
+    const TAG_FLOAT: u8 = 0x05;       // Boxed BCD float
 
     /// Generate the complete Z80 LISP interpreter binary
     pub fn generate(&mut self) -> Vec<u8> {
@@ -786,20 +793,29 @@ impl CodeGen {
         self.dec_rr(Self::HL);
         self.ret();
 
-        // alloc_float: Allocate a 6-byte float, returns address in HL (with TAG_FLOAT)
-        // BCD Float format (6 bytes):
+        // alloc_float: Allocate 8 bytes, returns address in HL (with TAG_FLOAT)
+        // BCD Float format (6 bytes used, 8 allocated for alignment):
         //   Byte 0: Sign (0x00 = positive, 0x80 = negative)
         //   Byte 1: Exponent (biased by 128: exp 128 = 10^0)
         //   Bytes 2-5: BCD mantissa (8 digits, big-endian, normalized)
         // Returns pointer with TAG_FLOAT in low bits
+        // NOTE: Heap must start at 8-byte aligned address for this to work
         self.label("alloc_float");
         self.push(Self::DE);
         self.ld_hl_mem(Self::HEAP_PTR);
-        self.push(Self::HL);
-        self.ld_rr_nn(Self::DE, 6);  // 6 bytes for float
+        // Align to 8 bytes: HL = (HL + 7) & ~7
+        self.ld_rr_nn(Self::DE, 7);
+        self.add_hl_rr(Self::DE);
+        self.ld_r_r(Self::A, Self::L);
+        self.and_n(0xF8);  // Clear low 3 bits
+        self.ld_r_r(Self::L, Self::A);
+        // Now HL is 8-byte aligned
+        self.push(Self::HL);  // save aligned address
+        self.ld_rr_nn(Self::DE, 8);  // 8 bytes for float
         self.add_hl_rr(Self::DE);
         self.ld_mem_hl(Self::HEAP_PTR);
-        self.pop(Self::HL);
+        self.pop(Self::HL);  // get aligned address
+        // Add float tag (0x04)
         self.ld_r_r(Self::A, Self::L);
         self.or_n(Self::TAG_FLOAT);  // Add float tag
         self.ld_r_r(Self::L, Self::A);
@@ -809,15 +825,25 @@ impl CodeGen {
         // float_ptr: Strip tag from float pointer in HL, returns raw address in HL
         self.label("float_ptr");
         self.ld_r_r(Self::A, Self::L);
-        self.and_n(0xFC);  // Clear low 2 bits (tag)
+        self.and_n(0xF8);  // Clear low 3 bits (TAG_FLOAT = 0x04 uses bit 2)
         self.ld_r_r(Self::L, Self::A);
         self.ret();
 
         // is_float: Check if HL is a float, sets Z flag if true
+        // Float: L & 0x07 == 0x05 AND H >= 0x50
         self.label("is_float");
         self.ld_r_r(Self::A, Self::L);
-        self.and_n(0x07);  // Check low 3 bits
+        self.and_n(0x07);
         self.cp_n(Self::TAG_FLOAT);
+        self.ret_cc(Self::NZ);  // Not a float (low bits don't match)
+        self.ld_r_r(Self::A, Self::H);
+        self.cp_n((Self::HEAP_START >> 8) as u8);
+        // Z is set if carry is clear (H >= 0x50) - use ccf and test
+        // Actually CP sets carry if A < n, clears if A >= n
+        // So after cp 0x50: if H >= 0x50, carry is clear (NC)
+        // We want Z set if float. Use: if NC, set Z by cp A,A
+        self.ret_cc(Self::CC);  // Carry set means H < 0x50, not a float (NZ already from cp)
+        self.cp_r(Self::A);     // A == A, sets Z flag
         self.ret();
 
         // car: Get car of cons in HL, result in HL
@@ -1179,17 +1205,38 @@ impl CodeGen {
         self.ret();
 
         self.label("read_sym_not_n");
-        // Check for IF
+        // Check for IF or ITOF (both start with I)
         self.cp_n(b'I');
         self.jr_cc_label(Self::NZ, "read_sym_not_if");
         self.call_label("peek_char");
         self.cp_n(b'F');
-        self.jp_cc_label(Self::NZ, "read_sym_intern");
+        self.jr_cc_label(Self::NZ, "read_sym_i_not_f");
+        // IF - second char is F
         self.call_label("get_char");
         self.call_label("peek_char");
         self.call_label("is_delimiter");
         self.jp_cc_label(Self::NZ, "read_sym_intern");
         self.ld_rr_nn(Self::HL, Self::SYM_IF);
+        self.ret();
+
+        self.label("read_sym_i_not_f");
+        // Check for ITOF - second char should be T
+        self.cp_n(b'T');
+        self.jp_cc_label(Self::NZ, "read_sym_intern");
+        // ITOF - second char is T
+        self.call_label("get_char");  // T
+        self.call_label("peek_char");
+        self.cp_n(b'O');
+        self.jp_cc_label(Self::NZ, "read_sym_intern");
+        self.call_label("get_char");  // O
+        self.call_label("peek_char");
+        self.cp_n(b'F');
+        self.jp_cc_label(Self::NZ, "read_sym_intern");
+        self.call_label("get_char");  // F
+        self.call_label("peek_char");
+        self.call_label("is_delimiter");
+        self.jp_cc_label(Self::NZ, "read_sym_intern");
+        self.ld_rr_nn(Self::HL, Self::SYM_ITOF);
         self.ret();
 
         self.label("read_sym_not_if");
@@ -1565,33 +1612,7 @@ impl CodeGen {
         self.jp_label("read_sym_intern");
 
         self.label("read_sym_not_f");
-        // Check for ITOF (I-word)
-        self.cp_n(b'I');
-        self.jp_cc_label(Self::NZ, "read_sym_not_i");
-        self.call_label("peek_char");
-        self.cp_n(b'T');
-        self.jr_cc_label(Self::NZ, "read_sym_i_not_t");
-        // ITOF
-        self.call_label("get_char");  // T
-        self.call_label("peek_char");
-        self.cp_n(b'O');
-        self.jp_cc_label(Self::NZ, "read_sym_intern");
-        self.call_label("get_char");  // O
-        self.call_label("peek_char");
-        self.cp_n(b'F');
-        self.jp_cc_label(Self::NZ, "read_sym_intern");
-        self.call_label("get_char");  // F
-        self.call_label("peek_char");
-        self.call_label("is_delimiter");
-        self.jp_cc_label(Self::NZ, "read_sym_intern");
-        self.ld_rr_nn(Self::HL, Self::SYM_ITOF);
-        self.ret();
-
-        self.label("read_sym_i_not_t");
-        // IF is handled elsewhere, so fall through
-        self.jp_label("read_sym_intern");
-
-        self.label("read_sym_not_i");
+        // ITOF is now handled in the I-word section (with IF)
 
         // Check for OR
         self.cp_n(b'O');
@@ -1773,12 +1794,12 @@ impl CodeGen {
         self.ret();
 
         self.label("read_sym_not_s");
-        // Check for READ (starts with R)
+        // Check for READ, RTADDR (start with R)
         self.cp_n(b'R');
         self.jp_cc_label(Self::NZ, "read_sym_intern");
         self.call_label("peek_char");
         self.cp_n(b'E');
-        self.jp_cc_label(Self::NZ, "read_sym_intern");
+        self.jr_cc_label(Self::NZ, "read_sym_r_not_e");
         self.call_label("get_char");  // E
         self.call_label("peek_char");
         self.cp_n(b'A');
@@ -1792,6 +1813,33 @@ impl CodeGen {
         self.call_label("is_delimiter");
         self.jp_cc_label(Self::NZ, "read_sym_intern");
         self.ld_rr_nn(Self::HL, Self::SYM_READ);
+        self.ret();
+
+        self.label("read_sym_r_not_e");
+        // Check for RTADDR
+        self.cp_n(b'T');
+        self.jp_cc_label(Self::NZ, "read_sym_intern");
+        self.call_label("get_char");  // T
+        self.call_label("peek_char");
+        self.cp_n(b'A');
+        self.jp_cc_label(Self::NZ, "read_sym_intern");
+        self.call_label("get_char");  // A
+        self.call_label("peek_char");
+        self.cp_n(b'D');
+        self.jp_cc_label(Self::NZ, "read_sym_intern");
+        self.call_label("get_char");  // D
+        self.call_label("peek_char");
+        self.cp_n(b'D');
+        self.jp_cc_label(Self::NZ, "read_sym_intern");
+        self.call_label("get_char");  // D
+        self.call_label("peek_char");
+        self.cp_n(b'R');
+        self.jp_cc_label(Self::NZ, "read_sym_intern");
+        self.call_label("get_char");  // R
+        self.call_label("peek_char");
+        self.call_label("is_delimiter");
+        self.jp_cc_label(Self::NZ, "read_sym_intern");
+        self.ld_rr_nn(Self::HL, Self::SYM_RTADDR);
         self.ret();
 
         self.label("read_sym_intern");
@@ -1926,11 +1974,34 @@ impl CodeGen {
     fn generate_printer(&mut self) {
         // print_expr: Print S-expression in HL
         self.label("print_expr");
-        // Check type tag
+        // Check for float: L & 0x07 == 0x05 AND H >= 0x50 (heap address)
+        // Floats use tag 0x05 (looks like fixnum with bit 2 set) but are in heap
+        // Fixnums are immediate values with H < 0x50 typically
+        self.ld_r_r(Self::A, Self::L);
+        self.and_n(0x07);
+        self.cp_n(Self::TAG_FLOAT);
+        self.jr_cc_label(Self::NZ, "print_not_float");
+        // Low 3 bits = 0x05, now check if in heap
+        self.ld_r_r(Self::A, Self::H);
+        self.cp_n((Self::HEAP_START >> 8) as u8);
+        self.jp_cc_label(Self::NC, "print_float");  // H >= 0x50, it's a float
+        self.label("print_not_float");
+        // Now check 2-bit type tag
         self.ld_r_r(Self::A, Self::L);
         self.and_n(0x03);
         // Check for cons (tag = 00)
-        self.jp_cc_label(Self::NZ, "print_not_cons");
+        self.jp_cc_label(Self::Z, "print_check_nil");
+        // Check for fixnum (tag = 01)
+        self.cp_n(Self::TAG_FIXNUM);
+        self.jp_cc_label(Self::Z, "print_fixnum");
+        // Check for special (tag = 10)
+        self.cp_n(Self::TAG_SPECIAL);
+        self.jp_cc_label(Self::Z, "print_special");
+        // Symbol (tag = 11)
+        self.jp_label("print_symbol");
+
+        self.label("print_check_nil");
+        // Tag is 00 - cons cell
         // Check for special NIL (HL = 0x0000 or 0x0002)
         self.ld_r_r(Self::A, Self::H);
         self.or_r(Self::L);
@@ -1943,16 +2014,6 @@ impl CodeGen {
         self.cp_n((Self::LISP_NIL >> 8) as u8);
         self.jp_cc_label(Self::Z, "print_nil");
         self.jp_label("print_cons");
-
-        self.label("print_not_cons");
-        // Check for fixnum (tag = 01)
-        self.cp_n(Self::TAG_FIXNUM);
-        self.jp_cc_label(Self::Z, "print_fixnum");
-        // Check for special (tag = 10)
-        self.cp_n(Self::TAG_SPECIAL);
-        self.jp_cc_label(Self::Z, "print_special");
-        // Symbol (tag = 11)
-        self.jp_label("print_symbol");
 
         // print_nil
         self.label("print_nil");
@@ -2133,6 +2194,59 @@ impl CodeGen {
         self.label("print_list_end");
         self.ld_r_n(Self::A, b')');
         self.jp_label("acia_putc");
+
+        // print_float: Print float value as decimal number with .0 suffix
+        // Format: -N.0 or N.0 where N is the integer value
+        self.label("print_float");
+        self.push(Self::HL);
+        self.call_label("float_ptr");  // HL = raw address
+        // Read sign byte
+        self.ld_r_r(Self::C, Self::HL_IND);  // C = sign (0x00 or 0x80)
+        self.inc_rr(Self::HL);  // skip to exponent
+        self.inc_rr(Self::HL);  // skip to mantissa
+        // Read 2-byte mantissa into DE
+        self.ld_r_r(Self::D, Self::HL_IND);  // high byte
+        self.inc_rr(Self::HL);
+        self.ld_r_r(Self::E, Self::HL_IND);  // low byte
+        // Check if negative and print minus sign
+        self.bit_n_r(7, Self::C);
+        self.jr_cc_label(Self::Z, "print_float_pos");
+        self.ld_r_n(Self::A, b'-');
+        self.call_label("acia_putc");
+        self.label("print_float_pos");
+        // Print DE as number
+        self.ld_r_r(Self::A, Self::D);
+        self.or_r(Self::E);
+        self.jr_cc_label(Self::NZ, "print_float_nonzero");
+        self.ld_r_n(Self::A, b'0');
+        self.call_label("acia_putc");
+        self.jr_label("print_float_decimal");
+        self.label("print_float_nonzero");
+        // Push marker and digits
+        self.ld_r_n(Self::A, 0xFF);
+        self.push(Self::AF);
+        self.label("print_float_loop");
+        self.ld_r_r(Self::A, Self::D);
+        self.or_r(Self::E);
+        self.jr_cc_label(Self::Z, "print_float_digits");
+        self.call_label("div10");
+        self.push(Self::AF);
+        self.jr_label("print_float_loop");
+        self.label("print_float_digits");
+        self.pop(Self::AF);
+        self.cp_n(0xFF);
+        self.jr_cc_label(Self::Z, "print_float_decimal");
+        self.add_a_n(b'0');
+        self.call_label("acia_putc");
+        self.jr_label("print_float_digits");
+        self.label("print_float_decimal");
+        // Print ".0" suffix to indicate float
+        self.ld_r_n(Self::A, b'.');
+        self.call_label("acia_putc");
+        self.ld_r_n(Self::A, b'0');
+        self.call_label("acia_putc");
+        self.pop(Self::HL);  // restore float pointer
+        self.ret();
     }
 
     /// Generate interpreter core
@@ -2140,7 +2254,17 @@ impl CodeGen {
         // interp: Interpret expression in HL, result in HL
         // Environment is stored at ENV_PTR (0x4004)
         self.label("interp");
-        // Check type tag
+        // First check for float: L & 0x07 == 0x05 AND H >= 0x50
+        // Floats use tag 0x05 and are in heap
+        self.ld_r_r(Self::A, Self::L);
+        self.and_n(0x07);
+        self.cp_n(Self::TAG_FLOAT);
+        self.jr_cc_label(Self::NZ, "interp_not_float");
+        self.ld_r_r(Self::A, Self::H);
+        self.cp_n((Self::HEAP_START >> 8) as u8);
+        self.ret_cc(Self::NC);  // Float (H >= 0x50) evaluates to itself
+        self.label("interp_not_float");
+        // Check 2-bit type tag
         self.ld_r_r(Self::A, Self::L);
         self.and_n(0x03);
 
@@ -2649,6 +2773,18 @@ impl CodeGen {
 
         self.label("interp_not_fdiv");
 
+        // RTADDR - get runtime address of a builtin
+        self.ld_r_r(Self::A, Self::L);
+        self.cp_n(Self::SYM_RTADDR as u8);
+        self.jr_cc_label(Self::NZ, "interp_not_rtaddr");
+        self.ld_r_r(Self::A, Self::H);
+        self.cp_n((Self::SYM_RTADDR >> 8) as u8);
+        self.jr_cc_label(Self::NZ, "interp_not_rtaddr");
+        self.pop(Self::HL);
+        self.jp_label("builtin_rtaddr");
+
+        self.label("interp_not_rtaddr");
+
         self.label("interp_unknown");
         // Unknown builtin - try user-defined function
         // Stack has original expression, HL has car (function symbol)
@@ -2937,22 +3073,72 @@ impl CodeGen {
         self.call_label("car");  // HL = else
         self.jp_label("interp"); // tail call to interpret else
 
-        // special_define: (DEFINE name value) - HL = expression
+        // special_define: (DEFINE name value) or (DEFINE (name args) body)
         // Adds name->value binding to the environment
         self.label("special_define");
-        self.call_label("cdr");  // skip DEFINE, HL = (name value)
-        self.push(Self::HL);
-        self.call_label("car");  // HL = name (symbol)
+        self.call_label("cdr");  // skip DEFINE, HL = (name value) or ((name args) body)
+        self.push(Self::HL);     // stack: [rest-expr]
+        self.call_label("car");  // HL = name or (name args)
+        // Check if this is function syntax: (DEFINE (name args) body)
+        self.ld_r_r(Self::A, Self::L);
+        self.and_n(0x03);
+        self.jr_cc_label(Self::NZ, "define_simple");
+        // It's a cons - function definition syntax
+        // HL = (name . args), need to create (LAMBDA args body...) and bind to name
+        // Stack: [rest-expr = ((name . args) body...)]
+        self.push(Self::HL);     // stack: [(name.args), rest-expr]
+        self.call_label("car");  // HL = name
+        self.ex_de_hl();         // DE = name
+        self.pop(Self::HL);      // HL = (name . args)
+        self.push(Self::DE);     // stack: [name, rest-expr]
+        self.call_label("cdr");  // HL = args (parameter list)
+        self.push(Self::HL);     // stack: [args, name, rest-expr]
+        // Get body from rest-expr using EX (SP),HL trick
+        // We need to get rest-expr which is 2 items down
+        // First pop args, then we can access rest-expr
+        self.pop(Self::BC);      // BC = args; stack: [name, rest-expr]
+        self.pop(Self::DE);      // DE = name; stack: [rest-expr]
+        self.pop(Self::HL);      // HL = rest-expr; stack: []
+        self.push(Self::DE);     // stack: [name]
+        self.push(Self::BC);     // stack: [args, name]
+        // Now HL = rest-expr = ((name.args) body...)
+        self.call_label("cdr");  // HL = (body...) - body expressions
+        // Build (LAMBDA args body...) = cons(LAMBDA, cons(args, body...))
+        // HL = (body...), need args from stack
+        self.ld_r_r(Self::B, Self::H);
+        self.ld_r_r(Self::C, Self::L);  // BC = (body...)
+        self.pop(Self::DE);      // DE = args; stack: [name]
+        // cons expects DE = car (args), BC = cdr (body...)
+        self.call_label("cons"); // HL = (args . (body...)) = (args body...)
+        // Now cons LAMBDA onto front
+        self.ld_r_r(Self::B, Self::H);
+        self.ld_r_r(Self::C, Self::L);  // BC = (args body...)
+        self.ld_rr_nn(Self::DE, Self::SYM_LAMBDA);  // DE = LAMBDA symbol
+        // cons expects DE = car (LAMBDA), BC = cdr ((args body...))
+        self.call_label("cons"); // HL = (LAMBDA args body...) = lambda form
+        // Now HL = lambda value, get name from stack
+        self.pop(Self::DE);      // DE = name; stack: []
+        // Create binding and add to env
+        self.jr_label("define_add_binding");
+
+        self.label("define_simple");
+        // Simple: (DEFINE name value)
         self.ex_de_hl();         // DE = name
         self.pop(Self::HL);
         self.push(Self::DE);     // save name
         self.call_label("cdr");  // HL = (value)
         self.call_label("car");  // HL = value expr
         self.call_label("interp");  // HL = evaluated value
-        // Now create (name . value) pair
         self.pop(Self::DE);      // DE = name
+        // Fall through to add binding
+
+        self.label("define_add_binding");
+        // HL = value, DE = name
+        // Create (name . value) pair
+        // cons expects DE = car (name), BC = cdr (value)
         self.ld_r_r(Self::B, Self::H);
-        self.ld_r_r(Self::C, Self::L);  // BC = value
+        self.ld_r_r(Self::C, Self::L);  // BC = value (cdr)
+        // DE already = name (car)
         self.call_label("cons"); // HL = (name . value)
         // Add to front of environment: ((name . value) . old_env)
         self.ex_de_hl();         // DE = (name . value)
@@ -2963,7 +3149,8 @@ impl CodeGen {
         self.ld_mem_hl(Self::ENV_PTR);  // save new env
         // Return the name as result
         self.call_label("car");  // HL = (name . value)
-        self.jp_label("car");    // return name
+        self.call_label("car");  // HL = name
+        self.ret();
 
         // special_setq: (SETQ name value) - HL = expression
         // Modifies existing binding in environment
@@ -3271,6 +3458,51 @@ impl CodeGen {
         self.ex_de_hl();  // swap so DE = quotient
         self.ret();
 
+        // sdiv16: Signed division DE / HL -> HL (quotient)
+        // Handles negative numbers correctly
+        self.label("sdiv16");
+        // Track result sign: XOR of dividend and divisor signs
+        self.ld_r_r(Self::A, Self::D);
+        self.xor_r(Self::H);
+        self.push(Self::AF);        // Save sign on stack (bit 7 = result negative)
+        // Make dividend (DE) positive
+        self.bit_n_r(7, Self::D);
+        self.jr_cc_label(Self::Z, "sdiv_de_pos");
+        self.push(Self::HL);
+        self.ex_de_hl();
+        self.ld_rr_nn(Self::DE, 0);
+        self.ex_de_hl();            // HL = 0
+        self.or_r(Self::A);
+        self.sbc_hl_rr(Self::DE);   // HL = -DE
+        self.ex_de_hl();            // DE = |DE|
+        self.pop(Self::HL);
+        self.label("sdiv_de_pos");
+        // Make divisor (HL) positive, put in BC
+        self.bit_n_r(7, Self::H);
+        self.jr_cc_label(Self::Z, "sdiv_hl_pos");
+        self.push(Self::DE);
+        self.ex_de_hl();            // DE = HL
+        self.ld_rr_nn(Self::HL, 0);
+        self.or_r(Self::A);
+        self.sbc_hl_rr(Self::DE);   // HL = |divisor|
+        self.pop(Self::DE);
+        self.label("sdiv_hl_pos");
+        // Now DE = |dividend|, HL = |divisor|
+        self.ld_r_r(Self::B, Self::H);
+        self.ld_r_r(Self::C, Self::L);  // BC = |divisor|
+        self.call_label("div16");   // DE = quotient (unsigned)
+        self.ex_de_hl();            // HL = quotient
+        // Apply result sign
+        self.pop(Self::AF);
+        self.bit_n_r(7, Self::A);
+        self.ret_cc(Self::Z);       // Positive result, done
+        // Negate HL
+        self.ex_de_hl();
+        self.ld_rr_nn(Self::HL, 0);
+        self.or_r(Self::A);
+        self.sbc_hl_rr(Self::DE);
+        self.ret();
+
         // builtin_mod: (% a b) - modulo, returns remainder
         self.label("builtin_mod");
         self.call_label("cdr");
@@ -3324,15 +3556,15 @@ impl CodeGen {
         self.push(Self::HL);
         self.call_label("car");  // first arg
         self.call_label("interp");
-        self.ex_de_hl();  // DE = car value
-        self.pop(Self::HL);
-        self.call_label("cdr");
-        self.push(Self::DE);
-        self.call_label("car");  // second arg
-        self.call_label("interp");
+        self.pop(Self::DE);         // DE = args (cdr trashes DE, so save/restore here)
+        self.push(Self::HL);        // save car value
+        self.ex_de_hl();            // HL = args
+        self.call_label("cdr");     // HL = (second-arg)
+        self.call_label("car");     // HL = second arg
+        self.call_label("interp");  // HL = evaluated second arg
         self.ld_r_r(Self::B, Self::H);
         self.ld_r_r(Self::C, Self::L);  // BC = cdr value
-        self.pop(Self::DE);  // DE = car value
+        self.pop(Self::DE);         // DE = car value
         self.jp_label("cons");
 
         // builtin_eq: (= a b) - numeric equality
@@ -3683,11 +3915,11 @@ impl CodeGen {
         self.call_label("cdr");
         self.call_label("car");
         self.call_label("interp");  // HL = fixnum
-        // Convert fixnum to integer
-        self.srl_r(Self::H);
+        // Convert fixnum to integer (arithmetic shift to preserve sign)
+        self.sra_r(Self::H);
         self.rr_r(Self::L);
-        self.srl_r(Self::H);
-        self.rr_r(Self::L);  // HL = integer value
+        self.sra_r(Self::H);
+        self.rr_r(Self::L);  // HL = integer value (sign-extended)
         self.push(Self::HL);  // save integer
         // Allocate float
         self.call_label("alloc_float");
@@ -3720,15 +3952,11 @@ impl CodeGen {
         self.inc_rr(Self::HL);  // point to exponent
         self.push(Self::HL);
         self.push(Self::BC);  // save float pointer
-        // For simplicity, we'll convert up to 5 digits (max 65535)
-        // Exponent = 128 + (number of digits - 1)
-        // First, count digits and convert to BCD
-        self.push(Self::DE);  // save value
-        // Convert binary to BCD using double-dabble or division
-        // For now, use simple division by powers of 10
-        self.call_label("bin_to_bcd");  // DE=value -> stores BCD at stack area
-        self.pop(Self::HL);  // HL = float address (exponent)
+        // Convert binary to BCD using division by powers of 10
+        // bin_to_bcd expects DE = value, returns DE = BCD, A = exponent
+        self.call_label("bin_to_bcd");  // DE=value -> returns value in DE, exp in A
         self.pop(Self::BC);  // BC = float pointer
+        self.pop(Self::HL);  // HL = float address (exponent)
         self.ld_r_r(Self::HL_IND, Self::A);  // store exponent
         self.inc_rr(Self::HL);
         // Copy 4 BCD bytes from temp area
@@ -3748,9 +3976,7 @@ impl CodeGen {
         // For simplicity, we store the value directly (not true BCD)
         // This is a simplified float where mantissa = raw binary value
         self.label("bin_to_bcd");
-        self.pop(Self::HL);  // return address
-        self.pop(Self::DE);  // value
-        self.push(Self::HL);  // put return address back
+        // DE = value on entry
         // Just return the value in DE with exponent 128 (10^0 = 1)
         // This means the float stores the integer directly
         self.ld_r_n(Self::A, 128);  // exponent = 128 means value * 10^0 = value
@@ -3807,55 +4033,58 @@ impl CodeGen {
         self.ret();
 
         // builtin_fadd: (FADD a b) - add two floats
+        // Simpler approach: use builtin_ftoi to convert, add, then builtin_itof
         self.label("builtin_fadd");
-        // For now, simple implementation: convert to int, add, convert back
-        // TODO: proper BCD addition with alignment
-        self.call_label("cdr");
-        self.push(Self::HL);
-        self.call_label("car");
-        self.call_label("interp");  // first arg
-        self.push(Self::HL);
-        // Convert first to int
+        // Get first arg and convert to int
+        self.call_label("cdr");     // HL = (a b)
+        self.push(Self::HL);        // Stack: [args]
+        self.call_label("car");     // HL = a
+        self.call_label("interp");  // HL = evaluated first arg (float)
+        // Convert float to int value
         self.call_label("is_float");
-        self.jr_cc_label(Self::NZ, "fadd_first_int");
+        self.jr_cc_label(Self::NZ, "fadd_first_fixnum");
+        // It's a float - use float_to_int_internal
         self.call_label("float_to_int_internal");
-        self.jr_label("fadd_have_first");
-        self.label("fadd_first_int");
-        // It's a fixnum, extract value
-        self.srl_r(Self::H);
+        self.jr_label("fadd_first_done");
+        self.label("fadd_first_fixnum");
+        // It's a fixnum - extract raw value (arithmetic shift for sign)
+        self.sra_r(Self::H);
         self.rr_r(Self::L);
-        self.srl_r(Self::H);
+        self.sra_r(Self::H);
         self.rr_r(Self::L);
-        self.label("fadd_have_first");
-        self.pop(Self::DE);  // discard original first
-        self.push(Self::HL);  // save first int
+        self.label("fadd_first_done");
+        // HL = first value (integer), Stack: [args]
+        self.pop(Self::DE);         // DE = args
+        self.push(Self::HL);        // Stack: [first_val]
+        self.ex_de_hl();            // HL = args
         // Get second arg
-        self.pop(Self::HL);  // args
-        self.call_label("cdr");
-        self.call_label("car");
-        self.call_label("interp");  // second arg
+        self.call_label("cdr");     // HL = (b)
+        self.call_label("car");     // HL = b
+        self.call_label("interp");  // HL = evaluated second arg
         self.call_label("is_float");
-        self.jr_cc_label(Self::NZ, "fadd_second_int");
+        self.jr_cc_label(Self::NZ, "fadd_second_fixnum");
         self.call_label("float_to_int_internal");
-        self.jr_label("fadd_have_second");
-        self.label("fadd_second_int");
-        self.srl_r(Self::H);
+        self.jr_label("fadd_second_done");
+        self.label("fadd_second_fixnum");
+        self.sra_r(Self::H);
         self.rr_r(Self::L);
-        self.srl_r(Self::H);
+        self.sra_r(Self::H);
         self.rr_r(Self::L);
-        self.label("fadd_have_second");
-        self.pop(Self::DE);  // first int
-        self.add_hl_rr(Self::DE);  // sum
-        // Convert back to float
-        self.push(Self::HL);
-        self.call_label("alloc_float");
-        self.push(Self::HL);
-        self.call_label("float_ptr");
-        self.ex_de_hl();
-        self.pop(Self::BC);  // float pointer
-        self.pop(Self::HL);  // sum
-        // Store as simple integer float
-        self.call_label("store_int_as_float");
+        self.label("fadd_second_done");
+        // HL = second value, Stack: [first_val]
+        self.pop(Self::DE);         // DE = first value
+        self.add_hl_rr(Self::DE);   // HL = sum
+        // Now convert sum to float - reuse builtin_itof logic
+        self.push(Self::HL);        // save sum
+        self.call_label("alloc_float");  // HL = new float ptr (with tag)
+        self.push(Self::HL);        // save float ptr
+        self.call_label("float_ptr");  // HL = raw address
+        self.ex_de_hl();            // DE = raw float address
+        self.pop(Self::BC);         // BC = float pointer with tag
+        self.pop(Self::HL);         // HL = sum
+        // Store sum as float
+        self.call_label("store_int_as_float");  // DE=addr, HL=int
+        // Return float pointer
         self.ld_r_r(Self::H, Self::B);
         self.ld_r_r(Self::L, Self::C);
         self.ret();
@@ -3920,45 +4149,46 @@ impl CodeGen {
 
         // builtin_fsub: (FSUB a b) - subtract floats
         self.label("builtin_fsub");
-        // Same as fadd but negate second
-        self.call_label("cdr");
-        self.push(Self::HL);
-        self.call_label("car");
-        self.call_label("interp");
-        self.push(Self::HL);
+        // Get first arg and convert to int
+        self.call_label("cdr");     // HL = (a b)
+        self.push(Self::HL);        // Stack: [args]
+        self.call_label("car");     // HL = a
+        self.call_label("interp");  // HL = evaluated first arg
         self.call_label("is_float");
-        self.jr_cc_label(Self::NZ, "fsub_first_int");
+        self.jr_cc_label(Self::NZ, "fsub_first_fixnum");
         self.call_label("float_to_int_internal");
-        self.jr_label("fsub_have_first");
-        self.label("fsub_first_int");
-        self.srl_r(Self::H);
+        self.jr_label("fsub_first_done");
+        self.label("fsub_first_fixnum");
+        self.sra_r(Self::H);
         self.rr_r(Self::L);
-        self.srl_r(Self::H);
+        self.sra_r(Self::H);
         self.rr_r(Self::L);
-        self.label("fsub_have_first");
-        self.pop(Self::DE);
-        self.push(Self::HL);
-        self.pop(Self::HL);  // args
-        self.call_label("cdr");
-        self.call_label("car");
-        self.call_label("interp");
+        self.label("fsub_first_done");
+        // HL = first value (integer), Stack: [args]
+        self.pop(Self::DE);         // DE = args
+        self.push(Self::HL);        // Stack: [first_val]
+        self.ex_de_hl();            // HL = args
+        // Get second arg
+        self.call_label("cdr");     // HL = (b)
+        self.call_label("car");     // HL = b
+        self.call_label("interp");  // HL = evaluated second arg
         self.call_label("is_float");
-        self.jr_cc_label(Self::NZ, "fsub_second_int");
+        self.jr_cc_label(Self::NZ, "fsub_second_fixnum");
         self.call_label("float_to_int_internal");
-        self.jr_label("fsub_have_second");
-        self.label("fsub_second_int");
-        self.srl_r(Self::H);
+        self.jr_label("fsub_second_done");
+        self.label("fsub_second_fixnum");
+        self.sra_r(Self::H);
         self.rr_r(Self::L);
-        self.srl_r(Self::H);
+        self.sra_r(Self::H);
         self.rr_r(Self::L);
-        self.label("fsub_have_second");
-        self.pop(Self::DE);
+        self.label("fsub_second_done");
+        // HL = second value, Stack: [first_val]
+        self.pop(Self::DE);         // DE = first value
+        // Subtract: first - second = DE - HL
+        self.ex_de_hl();            // HL = first, DE = second
         self.or_r(Self::A);
-        self.sbc_hl_rr(Self::DE);  // HL = second - first? No: DE - HL
-        // Wait, we have first in DE, second in HL. Want first - second
-        self.ex_de_hl();
-        self.or_r(Self::A);
-        self.sbc_hl_rr(Self::DE);  // HL = first - second
+        self.sbc_hl_rr(Self::DE);   // HL = first - second
+        // Convert result to float
         self.push(Self::HL);
         self.call_label("alloc_float");
         self.push(Self::HL);
@@ -3973,42 +4203,47 @@ impl CodeGen {
 
         // builtin_fmul: (FMUL a b) - multiply floats
         self.label("builtin_fmul");
-        // Simple: convert to int, multiply, convert back
-        // Note: This loses precision for large numbers
-        self.call_label("cdr");
-        self.push(Self::HL);
-        self.call_label("car");
-        self.call_label("interp");
-        self.push(Self::HL);
+        // Get first arg and convert to int
+        self.call_label("cdr");     // HL = (a b)
+        self.push(Self::HL);        // Stack: [args]
+        self.call_label("car");     // HL = a
+        self.call_label("interp");  // HL = evaluated first arg
         self.call_label("is_float");
-        self.jr_cc_label(Self::NZ, "fmul_first_int");
+        self.jr_cc_label(Self::NZ, "fmul_first_fixnum");
         self.call_label("float_to_int_internal");
-        self.jr_label("fmul_have_first");
-        self.label("fmul_first_int");
-        self.srl_r(Self::H);
+        self.jr_label("fmul_first_done");
+        self.label("fmul_first_fixnum");
+        self.sra_r(Self::H);
         self.rr_r(Self::L);
-        self.srl_r(Self::H);
+        self.sra_r(Self::H);
         self.rr_r(Self::L);
-        self.label("fmul_have_first");
-        self.pop(Self::DE);
-        self.push(Self::HL);
-        self.pop(Self::HL);
-        self.call_label("cdr");
-        self.call_label("car");
-        self.call_label("interp");
+        self.label("fmul_first_done");
+        // HL = first value (integer), Stack: [args]
+        self.pop(Self::DE);         // DE = args
+        self.push(Self::HL);        // Stack: [first_val]
+        self.ex_de_hl();            // HL = args
+        // Get second arg
+        self.call_label("cdr");     // HL = (b)
+        self.call_label("car");     // HL = b
+        self.call_label("interp");  // HL = evaluated second arg
         self.call_label("is_float");
-        self.jr_cc_label(Self::NZ, "fmul_second_int");
+        self.jr_cc_label(Self::NZ, "fmul_second_fixnum");
         self.call_label("float_to_int_internal");
-        self.jr_label("fmul_have_second");
-        self.label("fmul_second_int");
-        self.srl_r(Self::H);
+        self.jr_label("fmul_second_done");
+        self.label("fmul_second_fixnum");
+        self.sra_r(Self::H);
         self.rr_r(Self::L);
-        self.srl_r(Self::H);
+        self.sra_r(Self::H);
         self.rr_r(Self::L);
-        self.label("fmul_have_second");
-        self.pop(Self::DE);
-        // Multiply DE * HL (16-bit)
+        self.label("fmul_second_done");
+        // HL = second value, Stack: [first_val]
+        self.pop(Self::DE);         // DE = first value
+        // Multiply: DE * HL -> HL
+        self.ld_r_r(Self::B, Self::H);
+        self.ld_r_r(Self::C, Self::L);  // BC = second
+        // DE = first, BC = second, call mul16 which does DE * BC -> HL
         self.call_label("mul16");
+        // Convert result to float
         self.push(Self::HL);
         self.call_label("alloc_float");
         self.push(Self::HL);
@@ -4019,69 +4254,48 @@ impl CodeGen {
         self.call_label("store_int_as_float");
         self.ld_r_r(Self::H, Self::B);
         self.ld_r_r(Self::L, Self::C);
-        self.ret();
-
-        // mul16: DE * HL -> HL (16-bit result, overflow ignored)
-        self.label("mul16");
-        self.push(Self::BC);
-        self.ld_r_r(Self::B, Self::H);
-        self.ld_r_r(Self::C, Self::L);
-        self.ld_rr_nn(Self::HL, 0);
-        self.ld_r_n(Self::A, 16);
-        self.label("mul16_loop");
-        self.add_hl_hl();
-        self.ex_de_hl();
-        self.add_hl_hl();
-        self.ex_de_hl();
-        self.jr_cc_label(Self::NC, "mul16_noadd");
-        self.add_hl_rr(Self::BC);
-        self.label("mul16_noadd");
-        self.dec_r(Self::A);
-        self.jr_cc_label(Self::NZ, "mul16_loop");
-        self.pop(Self::BC);
         self.ret();
 
         // builtin_fdiv: (FDIV a b) - divide floats
         self.label("builtin_fdiv");
-        // Simple integer division
-        self.call_label("cdr");
-        self.push(Self::HL);
-        self.call_label("car");
-        self.call_label("interp");
-        self.push(Self::HL);
+        // Get first arg and convert to int
+        self.call_label("cdr");     // HL = (a b)
+        self.push(Self::HL);        // Stack: [args]
+        self.call_label("car");     // HL = a
+        self.call_label("interp");  // HL = evaluated first arg
         self.call_label("is_float");
-        self.jr_cc_label(Self::NZ, "fdiv_first_int");
+        self.jr_cc_label(Self::NZ, "fdiv_first_fixnum");
         self.call_label("float_to_int_internal");
-        self.jr_label("fdiv_have_first");
-        self.label("fdiv_first_int");
-        self.srl_r(Self::H);
+        self.jr_label("fdiv_first_done");
+        self.label("fdiv_first_fixnum");
+        self.sra_r(Self::H);
         self.rr_r(Self::L);
-        self.srl_r(Self::H);
+        self.sra_r(Self::H);
         self.rr_r(Self::L);
-        self.label("fdiv_have_first");
-        self.pop(Self::DE);
-        self.push(Self::HL);
-        self.pop(Self::HL);
-        self.call_label("cdr");
-        self.call_label("car");
-        self.call_label("interp");
+        self.label("fdiv_first_done");
+        // HL = first value (integer), Stack: [args]
+        self.pop(Self::DE);         // DE = args
+        self.push(Self::HL);        // Stack: [first_val]
+        self.ex_de_hl();            // HL = args
+        // Get second arg
+        self.call_label("cdr");     // HL = (b)
+        self.call_label("car");     // HL = b
+        self.call_label("interp");  // HL = evaluated second arg
         self.call_label("is_float");
-        self.jr_cc_label(Self::NZ, "fdiv_second_int");
+        self.jr_cc_label(Self::NZ, "fdiv_second_fixnum");
         self.call_label("float_to_int_internal");
-        self.jr_label("fdiv_have_second");
-        self.label("fdiv_second_int");
-        self.srl_r(Self::H);
+        self.jr_label("fdiv_second_done");
+        self.label("fdiv_second_fixnum");
+        self.sra_r(Self::H);
         self.rr_r(Self::L);
-        self.srl_r(Self::H);
+        self.sra_r(Self::H);
         self.rr_r(Self::L);
-        self.label("fdiv_have_second");
-        self.pop(Self::DE);  // first
-        // HL = second (divisor), DE = first (dividend)
-        // We want first / second = DE / HL
-        self.push(Self::HL);  // save divisor
-        self.ex_de_hl();      // HL = dividend
-        self.pop(Self::DE);   // DE = divisor
-        self.call_label("div16");  // HL = HL / DE
+        self.label("fdiv_second_done");
+        // HL = second value (divisor), Stack: [first_val]
+        self.pop(Self::DE);         // DE = first value (dividend)
+        // Signed divide: first / second = DE / HL
+        self.call_label("sdiv16");  // HL = signed quotient
+        // Convert result to float
         self.push(Self::HL);
         self.call_label("alloc_float");
         self.push(Self::HL);
@@ -4094,28 +4308,98 @@ impl CodeGen {
         self.ld_r_r(Self::L, Self::C);
         self.ret();
 
-        // div16: HL / DE -> HL (quotient), uses BC
-        self.label("div16");
-        self.push(Self::BC);
-        self.ld_r_r(Self::A, Self::D);
-        self.or_r(Self::E);
-        self.jr_cc_label(Self::NZ, "div16_ok");
-        self.ld_rr_nn(Self::HL, 0);  // div by zero = 0
-        self.pop(Self::BC);
+        // builtin_rtaddr: (RTADDR 'symbol) - get runtime address of a builtin
+        // Returns the raw address as a fixnum (shifted left 2, OR'd with 1)
+        self.label("builtin_rtaddr");
+        self.call_label("cdr");     // HL = (symbol)
+        self.call_label("car");     // HL = symbol (unevaluated, should be quoted)
+        // If it's quoted, get the actual symbol
+        self.push(Self::HL);
+        self.call_label("car");     // HL = car (might be 'QUOTE)
+        self.ld_r_r(Self::A, Self::L);
+        self.cp_n(Self::SYM_QUOTE as u8);
+        self.jr_cc_label(Self::NZ, "rtaddr_not_quoted");
+        self.ld_r_r(Self::A, Self::H);
+        self.cp_n((Self::SYM_QUOTE >> 8) as u8);
+        self.jr_cc_label(Self::NZ, "rtaddr_not_quoted");
+        // It's quoted, get the cadr
+        self.pop(Self::HL);
+        self.call_label("cdr");
+        self.call_label("car");     // HL = actual symbol
+        self.jr_label("rtaddr_got_sym");
+        self.label("rtaddr_not_quoted");
+        self.pop(Self::HL);         // HL = original arg (symbol itself)
+        self.label("rtaddr_got_sym");
+        // Now HL = symbol to look up
+        // Check for each known builtin
+        // FADD
+        self.ld_r_r(Self::A, Self::L);
+        self.cp_n(Self::SYM_FADD as u8);
+        self.jr_cc_label(Self::NZ, "rtaddr_not_fadd");
+        self.ld_r_r(Self::A, Self::H);
+        self.cp_n((Self::SYM_FADD >> 8) as u8);
+        self.jr_cc_label(Self::NZ, "rtaddr_not_fadd");
+        self.ld_rr_nn_label(Self::HL, "builtin_fadd");
+        self.jr_label("rtaddr_done");
+        self.label("rtaddr_not_fadd");
+        // FSUB
+        self.ld_r_r(Self::A, Self::L);
+        self.cp_n(Self::SYM_FSUB as u8);
+        self.jr_cc_label(Self::NZ, "rtaddr_not_fsub");
+        self.ld_r_r(Self::A, Self::H);
+        self.cp_n((Self::SYM_FSUB >> 8) as u8);
+        self.jr_cc_label(Self::NZ, "rtaddr_not_fsub");
+        self.ld_rr_nn_label(Self::HL, "builtin_fsub");
+        self.jr_label("rtaddr_done");
+        self.label("rtaddr_not_fsub");
+        // FMUL
+        self.ld_r_r(Self::A, Self::L);
+        self.cp_n(Self::SYM_FMUL as u8);
+        self.jr_cc_label(Self::NZ, "rtaddr_not_fmul");
+        self.ld_r_r(Self::A, Self::H);
+        self.cp_n((Self::SYM_FMUL >> 8) as u8);
+        self.jr_cc_label(Self::NZ, "rtaddr_not_fmul");
+        self.ld_rr_nn_label(Self::HL, "builtin_fmul");
+        self.jr_label("rtaddr_done");
+        self.label("rtaddr_not_fmul");
+        // FDIV
+        self.ld_r_r(Self::A, Self::L);
+        self.cp_n(Self::SYM_FDIV as u8);
+        self.jr_cc_label(Self::NZ, "rtaddr_not_fdiv2");
+        self.ld_r_r(Self::A, Self::H);
+        self.cp_n((Self::SYM_FDIV >> 8) as u8);
+        self.jr_cc_label(Self::NZ, "rtaddr_not_fdiv2");
+        self.ld_rr_nn_label(Self::HL, "builtin_fdiv");
+        self.jr_label("rtaddr_done");
+        self.label("rtaddr_not_fdiv2");
+        // ITOF
+        self.ld_r_r(Self::A, Self::L);
+        self.cp_n(Self::SYM_ITOF as u8);
+        self.jr_cc_label(Self::NZ, "rtaddr_not_itof");
+        self.ld_r_r(Self::A, Self::H);
+        self.cp_n((Self::SYM_ITOF >> 8) as u8);
+        self.jr_cc_label(Self::NZ, "rtaddr_not_itof");
+        self.ld_rr_nn_label(Self::HL, "builtin_itof");
+        self.jr_label("rtaddr_done");
+        self.label("rtaddr_not_itof");
+        // FTOI
+        self.ld_r_r(Self::A, Self::L);
+        self.cp_n(Self::SYM_FTOI as u8);
+        self.jr_cc_label(Self::NZ, "rtaddr_not_ftoi");
+        self.ld_r_r(Self::A, Self::H);
+        self.cp_n((Self::SYM_FTOI >> 8) as u8);
+        self.jr_cc_label(Self::NZ, "rtaddr_not_ftoi");
+        self.ld_rr_nn_label(Self::HL, "builtin_ftoi");
+        self.jr_label("rtaddr_done");
+        self.label("rtaddr_not_ftoi");
+        // Unknown - return NIL
+        self.ld_rr_nn(Self::HL, Self::LISP_NIL);
         self.ret();
-        self.label("div16_ok");
-        self.ld_rr_nn(Self::BC, 0);  // quotient
-        self.label("div16_loop");
-        self.or_r(Self::A);
-        self.sbc_hl_rr(Self::DE);
-        self.jr_cc_label(Self::C, "div16_done");
-        self.inc_rr(Self::BC);
-        self.jr_label("div16_loop");
-        self.label("div16_done");
-        self.add_hl_rr(Self::DE);  // restore
-        self.ld_r_r(Self::H, Self::B);
-        self.ld_r_r(Self::L, Self::C);
-        self.pop(Self::BC);
+        self.label("rtaddr_done");
+        // Convert address in HL to fixnum (shift left 2, OR 1)
+        self.add_hl_rr(Self::HL);  // HL *= 2
+        self.add_hl_rr(Self::HL);  // HL *= 2 again (total *= 4)
+        self.inc_rr(Self::HL);     // HL |= 1 (tag as fixnum)
         self.ret();
 
         // special_cond: (COND (test1 expr1) (test2 expr2) ...)

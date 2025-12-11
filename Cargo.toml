@@ -2,7 +2,14 @@
 name = "kz80_lisp"
 version = "0.1.0"
 edition = "2021"
-description = "A minimal LISP interpreter for RetroShield Z80"
+description = "A minimal LISP interpreter and compiler for RetroShield Z80"
+license = "BSD-3-Clause"
+repository = "https://github.com/ajokela/kz80_lisp"
+homepage = "https://github.com/ajokela/kz80_lisp"
+readme = "README.md"
+keywords = ["lisp", "z80", "interpreter", "compiler", "retrocomputing"]
+categories = ["compilers", "emulators", "command-line-utilities"]
+authors = ["Alex Jokela"]
 
 [dependencies]
 

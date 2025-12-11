@@ -75,8 +75,10 @@ fn main() {
         },
     }));
 
-    // REPL
+    // REPL - use BufReader to properly handle buffered input from pipes
+    use std::io::BufRead;
     let stdin = io::stdin();
+    let mut reader = stdin.lock();
     let mut stdout = io::stdout();
 
     loop {
@@ -84,7 +86,7 @@ fn main() {
         stdout.flush().unwrap();
 
         let mut line = String::new();
-        match stdin.lock().read_line(&mut line) {
+        match reader.read_line(&mut line) {
             Ok(0) => break, // EOF
             Ok(_) => {}
             Err(e) => {
@@ -104,7 +106,7 @@ fn main() {
             print!("  ");
             stdout.flush().unwrap();
             let mut more = String::new();
-            match stdin.lock().read_line(&mut more) {
+            match reader.read_line(&mut more) {
                 Ok(0) => break,
                 Ok(_) => {
                     input.push('\n');
@@ -152,13 +154,26 @@ fn generate_z80(output_file: &str) {
     println!("Generated {} ({} bytes)", output_file, binary.len());
 }
 
-/// Check if parentheses are balanced
+/// Check if parentheses are balanced (handles strings and comments)
 fn is_balanced(s: &str) -> bool {
     let mut depth = 0i32;
     let mut in_string = false;
+    let mut in_comment = false;
     let mut escape = false;
 
     for ch in s.chars() {
+        // Newline ends comments
+        if ch == '\n' {
+            in_comment = false;
+            continue;
+        }
+
+        // Skip everything inside comments
+        if in_comment {
+            continue;
+        }
+
+        // Handle escape sequences in strings
         if escape {
             escape = false;
             continue;
@@ -167,13 +182,25 @@ fn is_balanced(s: &str) -> bool {
             escape = true;
             continue;
         }
+
+        // Handle string delimiters
         if ch == '"' {
             in_string = !in_string;
             continue;
         }
+
+        // Skip everything inside strings
         if in_string {
             continue;
         }
+
+        // Semicolon starts a comment
+        if ch == ';' {
+            in_comment = true;
+            continue;
+        }
+
+        // Count parentheses
         match ch {
             '(' => depth += 1,
             ')' => depth -= 1,

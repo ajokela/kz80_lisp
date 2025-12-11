@@ -211,10 +211,13 @@ fn special_define(expr: &Value, env: &mut Env) -> Result<Value, LispError> {
                 p = p.cdr()?;
             }
 
+            // Use empty environment for top-level defines to avoid exponential
+            // memory growth from nested clones. The function will look up
+            // bindings in the calling environment at call time.
             let lambda = Value::Lambda {
                 params,
                 body: Box::new(body),
-                env: env.clone(),
+                env: Env::new(),
             };
 
             env.define(&name, lambda);
