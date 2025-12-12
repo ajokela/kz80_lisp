@@ -1,6 +1,6 @@
 [package]
 name = "kz80_lisp"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A minimal LISP interpreter and compiler for RetroShield Z80"
 license = "BSD-3-Clause"
